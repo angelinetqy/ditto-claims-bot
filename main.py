@@ -4,6 +4,7 @@ Stage 2: detect "claim" comments, sync stock with Shopify, reply to buyers.
 Stage 3: auto invoices (Shopify draft orders), payment check, no-show release, strikes.
 """
 import asyncio
+import html
 import logging
 import os
 import re
@@ -325,17 +326,18 @@ async def get_draft(draft_id: str):
 
 # ---------------- post text ----------------
 def make_caption(item) -> str:
+    title = f"✨<b>{html.escape(item['title'])}</b>✨"
     if item["qty"] <= 0:
         return (
-            f"✨{item['title']}✨\n"
+            f"{title}\n"
             f"• Price: ${item['price']:.2f}\n"
             f"• SOLD OUT 🚫"
         )
     return (
-        f"✨{item['title']}✨\n"
+        f"{title}\n"
         f"• Price: ${item['price']:.2f}\n"
         f"• Quantity: {item['qty']}\n\n"
-        f"💭How to claim:\n"
+        f"<b>💭How to claim:</b>\n"
         f'• Comment "claim + qty" (e.g. claim 2) to claim! 😊'
     )
 
@@ -344,12 +346,16 @@ async def refresh_post(bot, channel_msg_id: int, title: str, price: float, qty: 
     """Edit the channel post so the quantity / SOLD OUT status is current."""
     caption = make_caption({"title": title, "price": price, "qty": qty})
     try:
-        await bot.edit_message_caption(CHANNEL, channel_msg_id, caption=caption)
+        await bot.edit_message_caption(
+            CHANNEL, channel_msg_id, caption=caption, parse_mode="HTML"
+        )
     except BadRequest as e:
         if "not modified" in str(e).lower():
             return
         try:  # post might be text-only
-            await bot.edit_message_text(caption, CHANNEL, channel_msg_id)
+            await bot.edit_message_text(
+                caption, CHANNEL, channel_msg_id, parse_mode="HTML"
+            )
         except BadRequest as e2:
             if "not modified" not in str(e2).lower():
                 log.warning("Could not edit post %s: %s", channel_msg_id, e2)
@@ -457,9 +463,11 @@ async def cmd_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             caption = make_caption(item)
             if item["image"]:
-                msg = await ctx.bot.send_photo(target, item["image"], caption=caption)
+                msg = await ctx.bot.send_photo(
+                    target, item["image"], caption=caption, parse_mode="HTML"
+                )
             else:
-                msg = await ctx.bot.send_message(target, caption)
+                msg = await ctx.bot.send_message(target, caption, parse_mode="HTML")
             if not test:
                 conn.execute(
                     "INSERT INTO posts VALUES (?,?,?,?,?,?)",
