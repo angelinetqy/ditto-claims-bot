@@ -17,6 +17,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     MessageOriginChannel,
+    ReplyParameters,
     Update,
 )
 from telegram.error import BadRequest, Forbidden
@@ -48,9 +49,8 @@ INVOICE_DELAY_MIN = int(os.environ.get("INVOICE_DELAY_MIN", "15"))  # after buye
 START_DEADLINE_MIN = int(os.environ.get("START_DEADLINE_MIN", "60"))  # to press Start on the bot
 PAY_DEADLINE_MIN = int(os.environ.get("PAY_DEADLINE_MIN", "60"))  # to pay after invoice is sent
 STRIKE_LIMIT = int(os.environ.get("STRIKE_LIMIT", "3"))
+OFFER_TTL = int(os.environ.get("OFFER_EXPIRY_HOURS", "24")) * 3600  # offers/counters expire after this
 
-# "claim", "claim 2", "claim x2", "claim 2x", "claim2"
-CLAIM_RE = re.compile(r"^\s*claim(?:\s*[x×]?\s*(\d{1,3})\s*[x×]?)?\s*[!.]*\s*$", re.I)
 
 stock_lock = asyncio.Lock()  # one stock change at a time
 _invoice_alerted = {}  # user_id -> last time we told admins an invoice failed
@@ -119,6 +119,30 @@ def db():
             alerted INTEGER DEFAULT 0,
             status TEXT DEFAULT 'sent'
         );
+        CREATE TABLE IF NOT EXISTS post_variants (
+            variant_id TEXT PRIMARY KEY,
+            product_id TEXT,
+            name TEXT,
+            price REAL,
+            position INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS offers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id TEXT,
+            variant_id TEXT,
+            title TEXT,
+            listed_price REAL,
+            offer_price REAL,
+            counter_price REAL,
+            final_price REAL,
+            user_id INTEGER,
+            user_name TEXT,
+            group_chat_id INTEGER,
+            group_msg_id INTEGER,
+            status TEXT DEFAULT 'pending',
+            created_at INTEGER,
+            updated_at INTEGER
+        );
         CREATE TABLE IF NOT EXISTS strikes (
             user_id INTEGER PRIMARY KEY,
             name TEXT,
@@ -127,6 +151,9 @@ def db():
         """
     )
     ensure_column(conn, "claims", "invoice_id", "INTEGER")
+    ensure_column(conn, "claims", "list_price", "REAL")
+    ensure_column(conn, "claims", "offer_id", "INTEGER")
+    ensure_column(conn, "posts", "offers_enabled", "INTEGER DEFAULT 0")
     return conn
 
 
@@ -192,12 +219,13 @@ shopify = Shopify()
 
 PRODUCTS_QUERY = """
 query($q: String!) {
-  products(first: 50, query: $q) {
+  products(first: 50, query: $q, sortKey: CREATED_AT, reverse: false) {
     nodes {
       id
       title
+      tags
       featuredImage { url }
-      variants(first: 1) { nodes { id price inventoryQuantity } }
+      variants(first: 20) { nodes { id title price inventoryQuantity } }
     }
   }
 }
@@ -269,24 +297,64 @@ mutation($orderId: ID!) {
 """
 
 
+PRODUCT_VARIANTS_QUERY = """
+query($id: ID!) {
+  product(id: $id) {
+    variants(first: 20) { nodes { id title price inventoryQuantity } }
+  }
+}
+"""
+
+
+def _variants_from_nodes(nodes):
+    multi = len(nodes) > 1
+    return [
+        {
+            "id": v["id"],
+            "name": v["title"] if multi else None,
+            "price": float(v["price"]),
+            "qty": int(v["inventoryQuantity"] or 0),
+        }
+        for v in nodes
+    ]
+
+
 async def fetch_sale_products():
     data = await shopify.gql(PRODUCTS_QUERY, {"q": f"tag:{SALE_TAG} AND status:active"})
     items = []
     for p in data["products"]["nodes"]:
-        v = p["variants"]["nodes"][0] if p["variants"]["nodes"] else None
-        if not v:
+        if not p["variants"]["nodes"]:
             continue
         items.append(
             {
                 "product_id": p["id"],
-                "variant_id": v["id"],
                 "title": p["title"],
-                "price": float(v["price"]),
-                "qty": int(v["inventoryQuantity"] or 0),
+                "variants": _variants_from_nodes(p["variants"]["nodes"]),
+                "offers": "offers" in [t.lower() for t in p.get("tags", [])],
                 "image": (p["featuredImage"] or {}).get("url"),
             }
         )
     return items
+
+
+async def fetch_product_variants(product_id: str):
+    d = await shopify.gql(PRODUCT_VARIANTS_QUERY, {"id": product_id})
+    p = d["product"]
+    return _variants_from_nodes(p["variants"]["nodes"]) if p else []
+
+
+def get_post_variants(conn, product_id: str):
+    """Variants (with names + posted prices) belonging to a channel post."""
+    rows = conn.execute(
+        "SELECT variant_id, name, price FROM post_variants WHERE product_id=? ORDER BY position",
+        (product_id,),
+    ).fetchall()
+    if rows:
+        return [{"variant_id": r[0], "name": r[1], "price": r[2]} for r in rows]
+    row = conn.execute(
+        "SELECT variant_id, price FROM posts WHERE product_id=?", (product_id,)
+    ).fetchone()  # posts made before variants existed
+    return [{"variant_id": row[0], "name": None, "price": float(row[1])}] if row else []
 
 
 async def get_stock(variant_id: str):
@@ -326,25 +394,49 @@ async def get_draft(draft_id: str):
 
 # ---------------- post text ----------------
 def make_caption(item) -> str:
+    """item = {"title": str, "offers": bool, "variants": [{"name", "price", "qty"}, ...]}"""
     title = f"✨<b>{html.escape(item['title'])}</b>✨"
-    if item["qty"] <= 0:
-        return (
+    variants = item["variants"]
+    offers = item.get("offers")
+
+    if len(variants) == 1:
+        v = variants[0]
+        if v["qty"] <= 0:
+            return f"{title}\n• Price: ${v['price']:.2f}\n• SOLD OUT 🚫"
+        text = (
             f"{title}\n"
-            f"• Price: ${item['price']:.2f}\n"
-            f"• SOLD OUT 🚫"
+            f"• Price: ${v['price']:.2f}\n"
+            f"• Quantity: {v['qty']}\n\n"
+            f"<b>💭How to claim:</b>\n"
+            f'• Comment "claim" to claim! 😊'
         )
-    return (
-        f"{title}\n"
-        f"• Price: ${item['price']:.2f}\n"
-        f"• Quantity: {item['qty']}\n\n"
+        if offers:
+            text += '\n• Want to haggle? Comment "offer &lt;price&gt;" 💸'
+        return text
+
+    lines = []
+    for v in variants:
+        stock = f"{v['qty']} left" if v["qty"] > 0 else "SOLD OUT 🚫"
+        lines.append(f"• {html.escape(v['name'])} — ${v['price']:.2f} ({stock})")
+    body = "\n".join(lines)
+    if all(v["qty"] <= 0 for v in variants):
+        return f"{title}\n{body}\n\n🚫 SOLD OUT"
+    cmds = [f'"claim {html.escape(v["name"].lower())}"' for v in variants if v["qty"] > 0]
+    joined = cmds[0] if len(cmds) == 1 else ", ".join(cmds[:-1]) + " or " + cmds[-1]
+    text = (
+        f"{title}\n{body}\n\n"
         f"<b>💭How to claim:</b>\n"
-        f'• Comment "claim + qty" (e.g. claim 2) to claim! 😊'
+        f"• Comment {joined} to claim! 😊"
     )
+    if offers:
+        example = html.escape(variants[0]["name"].lower())
+        text += f'\n• Want to haggle? Comment "offer {example} &lt;price&gt;" 💸'
+    return text
 
 
-async def refresh_post(bot, channel_msg_id: int, title: str, price: float, qty: int):
-    """Edit the channel post so the quantity / SOLD OUT status is current."""
-    caption = make_caption({"title": title, "price": price, "qty": qty})
+async def refresh_post(bot, channel_msg_id: int, item):
+    """Edit the channel post so quantities / SOLD OUT status are current."""
+    caption = make_caption(item)
     try:
         await bot.edit_message_caption(
             CHANNEL, channel_msg_id, caption=caption, parse_mode="HTML"
@@ -361,19 +453,41 @@ async def refresh_post(bot, channel_msg_id: int, title: str, price: float, qty: 
                 log.warning("Could not edit post %s: %s", channel_msg_id, e2)
 
 
-async def refresh_variant_post(bot, variant_id: str):
+async def refresh_product_post(bot, product_id: str):
     conn = db()
     row = conn.execute(
-        "SELECT channel_msg_id, title, price FROM posts WHERE variant_id=?", (variant_id,)
+        "SELECT channel_msg_id, title, offers_enabled FROM posts WHERE product_id=?",
+        (product_id,),
     ).fetchone()
     conn.close()
     if not row:
         return
     try:
-        stock, _, _ = await get_stock(variant_id)
-        await refresh_post(bot, row[0], row[1], float(row[2]), stock)
+        variants = await fetch_product_variants(product_id)
+        if variants:
+            await refresh_post(
+                bot,
+                row[0],
+                {"title": row[1], "variants": variants, "offers": bool(row[2])},
+            )
     except Exception:
-        log.exception("Could not refresh post for %s", variant_id)
+        log.exception("Could not refresh post for %s", product_id)
+
+
+async def refresh_products_for_variants(bot, variant_ids):
+    conn = db()
+    product_ids = set()
+    for vid in variant_ids:
+        r = conn.execute(
+            "SELECT product_id FROM post_variants WHERE variant_id=? "
+            "UNION SELECT product_id FROM posts WHERE variant_id=?",
+            (vid, vid),
+        ).fetchone()
+        if r:
+            product_ids.add(r[0])
+    conn.close()
+    for pid in product_ids:
+        await refresh_product_post(bot, pid)
 
 
 # ---------------- helpers ----------------
@@ -435,7 +549,7 @@ async def cmd_myid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/post       -> post all new Shopify items tagged 'telegram' to the channel
+    """/post       -> post all new Shopify items tagged 'telegram' to the channel (oldest first)
     /post test  -> send them to this chat only, nothing is saved"""
     if not is_admin(update):
         return
@@ -457,7 +571,7 @@ async def cmd_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "SELECT 1 FROM posts WHERE product_id = ?", (item["product_id"],)
         ).fetchone():
             continue
-        if item["qty"] <= 0:
+        if all(v["qty"] <= 0 for v in item["variants"]):
             skipped.append(f"{item['title']} (no stock)")
             continue
         try:
@@ -469,17 +583,25 @@ async def cmd_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             else:
                 msg = await ctx.bot.send_message(target, caption, parse_mode="HTML")
             if not test:
+                first = item["variants"][0]
                 conn.execute(
-                    "INSERT INTO posts VALUES (?,?,?,?,?,?)",
+                    "INSERT INTO posts (product_id, variant_id, channel_msg_id, title, price, "
+                    "posted_at, offers_enabled) VALUES (?,?,?,?,?,?,?)",
                     (
                         item["product_id"],
-                        item["variant_id"],
+                        first["id"],
                         msg.message_id,
                         item["title"],
-                        str(item["price"]),
+                        str(first["price"]),
                         now(),
+                        1 if item.get("offers") else 0,
                     ),
                 )
+                for i, v in enumerate(item["variants"]):
+                    conn.execute(
+                        "INSERT OR REPLACE INTO post_variants VALUES (?,?,?,?,?)",
+                        (v["id"], item["product_id"], v["name"], v["price"], i),
+                    )
                 conn.commit()
             posted += 1
             if not test:
@@ -538,11 +660,11 @@ async def cmd_sync(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cutoff = now() - 14 * 86400
     conn = db()
     rows = conn.execute(
-        "SELECT variant_id FROM posts WHERE posted_at > ?", (cutoff,)
+        "SELECT product_id FROM posts WHERE posted_at > ?", (cutoff,)
     ).fetchall()
     conn.close()
-    for (variant_id,) in rows:
-        await refresh_variant_post(ctx.bot, variant_id)
+    for (product_id,) in rows:
+        await refresh_product_post(ctx.bot, product_id)
         await asyncio.sleep(0.5)
     await update.message.reply_text(f"Synced {len(rows)} post(s).")
 
@@ -602,16 +724,61 @@ async def on_auto_forward(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     conn.close()
 
 
-async def on_comment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+CLAIM_START = re.compile(r"^\s*claim\b(.*)$", re.I | re.S)
+QTY_ONLY = re.compile(r"^[x×]?\s*(\d{1,3})\s*[x×]?$")
+QTY_TRAILING = re.compile(r"^(.*\S)\s+[x×]?(\d{1,3})[x×]?$")
+QTY_LEADING = re.compile(r"^[x×]?(\d{1,3})[x×]?\s+(.*\S)$")
+
+
+def norm(text: str) -> str:
+    return " ".join(re.sub(r"[^a-z0-9×]+", " ", text.lower()).split())
+
+
+def match_variants(name: str, variants):
+    if not name:
+        return []
+    exact = [v for v in variants if norm(v["name"]) == name]
+    if len(exact) == 1:
+        return exact
+    return [
+        v for v in variants
+        if norm(v["name"]).startswith(name) or name in norm(v["name"]).split()
+    ]
+
+
+def parse_claim(rest: str, variants):
+    """Returns (status, variant, qty). status: 'ok' | 'ask' (which one?) | 'ignore'."""
+    text = norm(rest)
+    if len(variants) == 1:  # normal single-item post: "claim" or "claim 2"
+        if text == "":
+            return "ok", variants[0], 1
+        m = QTY_ONLY.match(text)
+        if m and int(m.group(1)) >= 1:
+            return "ok", variants[0], int(m.group(1))
+        return "ignore", None, None
+
+    if not text:
+        return "ask", None, None
+    candidates = [(text, 1)]
+    m = QTY_TRAILING.match(text)
+    if m:
+        candidates.append((m.group(1), int(m.group(2))))
+    m = QTY_LEADING.match(text)
+    if m:
+        candidates.append((m.group(2), int(m.group(1))))
+    for name, qty in candidates:
+        if qty < 1:
+            continue
+        found = match_variants(name, variants)
+        if len(found) == 1:
+            return "ok", found[0], qty
+        if len(found) > 1:
+            return "ask", None, None
+    return "ask", None, None
+
+
+async def handle_claim(update: Update, ctx: ContextTypes.DEFAULT_TYPE, rest: str):
     msg = update.message
-    if not msg or not msg.text or not msg.from_user or msg.from_user.is_bot:
-        return
-    m = CLAIM_RE.match(msg.text)
-    if not m:
-        return
-    qty = int(m.group(1) or 1)
-    if qty < 1:
-        return
 
     conn = db()
     try:
@@ -630,13 +797,28 @@ async def on_comment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
         post = conn.execute(
-            "SELECT product_id, variant_id, title, price FROM posts WHERE channel_msg_id=?",
+            "SELECT product_id, title FROM posts WHERE channel_msg_id=?",
             (channel_msg_id,),
         ).fetchone()
         if not post:
             return
-        product_id, variant_id, title, price = post
-        price = float(price)
+        product_id, title = post
+        variants = get_post_variants(conn, product_id)
+        if not variants:
+            return
+
+        status, variant, qty = parse_claim(rest, variants)
+        if status == "ignore":
+            return
+        if status == "ask":
+            if len(rest.split()) <= 5:
+                options = " / ".join(f"claim {v['name'].lower()}" for v in variants)
+                await msg.reply_text(f"Which one would you like? 😊 Try: {options}")
+            return
+
+        variant_id = variant["variant_id"]
+        price = float(variant["price"])
+        claim_title = title if variant["name"] is None else f"{title} — {variant['name']}"
 
         user = msg.from_user
         first = user.first_name or "there"
@@ -668,6 +850,8 @@ async def on_comment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if qty > stock:
                 await msg.reply_text(
                     f"❌ Sorry {first}, only {stock} left! Try “claim {stock}”."
+                    if len(variants) == 1
+                    else f"❌ Sorry {first}, only {stock} left of that one!"
                 )
                 return
 
@@ -683,7 +867,7 @@ async def on_comment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "user_name, group_chat_id, group_msg_id, claimed_at) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (
-                    product_id, variant_id, title, price, qty, user.id,
+                    product_id, variant_id, claim_title, price, qty, user.id,
                     user.full_name, msg.chat_id, msg.message_id, now(),
                 ),
             )
@@ -699,14 +883,483 @@ async def on_comment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text(
         f"✅ Claim confirmed!\n\n"
         f"{first} claimed {qty} {plural(qty)} of:\n"
-        f"{title}\n"
+        f"{claim_title}\n"
         f"Price: ${price:.2f} each\n\n"
         f"{left_line}\n\n"
         f"💌 Tap the button below and press Start within {START_DEADLINE_MIN} minutes "
         f"so I can send your invoice.",
         reply_markup=button,
     )
-    await refresh_post(ctx.bot, channel_msg_id, title, price, remaining)
+    await refresh_product_post(ctx.bot, product_id)
+
+
+# ---------------- stage 4: offers ----------------
+OFFER_START = re.compile(r"^\s*offer\b(.*)$", re.I | re.S)
+ACCEPT_START = re.compile(r"^\s*accept\b(.*)$", re.I | re.S)
+PRICE_RE = re.compile(r"\$?\s*(\d{1,6}(?:\.\d{1,2})?)")
+
+
+async def on_comment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Routes comments in the discussion group: claim / offer / accept."""
+    msg = update.message
+    if not msg or not msg.text or not msg.from_user or msg.from_user.is_bot:
+        return
+    if len(msg.text) > 80:
+        return
+    m = CLAIM_START.match(msg.text)
+    if m:
+        await handle_claim(update, ctx, m.group(1))
+        return
+    m = OFFER_START.match(msg.text)
+    if m:
+        await handle_offer(update, ctx, m.group(1))
+        return
+    m = ACCEPT_START.match(msg.text)
+    if m:
+        await handle_accept(update, ctx, m.group(1))
+
+
+def locate_post(conn, msg):
+    """Which channel post is this comment under? -> (product_id, title, offers_enabled) or None."""
+    channel_msg_id = None
+    if msg.message_thread_id:
+        row = conn.execute(
+            "SELECT channel_msg_id FROM threads WHERE group_chat_id=? AND group_msg_id=?",
+            (msg.chat_id, msg.message_thread_id),
+        ).fetchone()
+        channel_msg_id = row[0] if row else None
+    if channel_msg_id is None:
+        channel_msg_id = channel_msg_from(msg.reply_to_message)
+    if channel_msg_id is None:
+        return None
+    return conn.execute(
+        "SELECT product_id, title, offers_enabled FROM posts WHERE channel_msg_id=?",
+        (channel_msg_id,),
+    ).fetchone()
+
+
+def display_name(user) -> str:
+    return f"@{user.username}" if user.username else user.full_name
+
+
+def parse_offer(rest: str, variants):
+    """Returns (status, variant, price). status: 'ok' | 'ask' | 'ignore'."""
+    text = rest.lower().replace(",", ".")
+    nums = list(PRICE_RE.finditer(text))
+    if not nums:
+        return "ignore", None, None
+    m = nums[-1]
+    price = float(m.group(1))
+    if price <= 0:
+        return "ignore", None, None
+    remainder = norm(text[: m.start()] + " " + text[m.end():])
+    if len(variants) == 1:
+        return ("ok", variants[0], price) if remainder == "" else ("ignore", None, None)
+    found = match_variants(remainder, variants)
+    if len(found) == 1:
+        return "ok", found[0], price
+    return "ask", None, None
+
+
+def offer_admin_message(o):
+    """o = (id, title, listed_price, offer_price, user_name)"""
+    pct = round(o[3] / o[2] * 100) if o[2] else 0
+    text = (
+        f"📝 New offer from {o[4]}\n\n"
+        f"Card: {o[1]}\n"
+        f"Listed: ${o[2]:.2f}\n"
+        f"Offered: ${o[3]:.2f} ({pct}%)"
+    )
+    markup = InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("✅ Accept", callback_data=f"of:a:{o[0]}"),
+            InlineKeyboardButton("💰 Counter", callback_data=f"of:c:{o[0]}"),
+            InlineKeyboardButton("❌ Decline", callback_data=f"of:d:{o[0]}"),
+        ]]
+    )
+    return text, markup
+
+
+async def send_offer_to_admins(bot, offer_id: int):
+    conn = db()
+    o = conn.execute(
+        "SELECT id, title, listed_price, offer_price, user_name FROM offers WHERE id=?",
+        (offer_id,),
+    ).fetchone()
+    conn.close()
+    if o:
+        text, markup = offer_admin_message(o)
+        await notify_admins(bot, text, markup)
+
+
+async def post_in_thread(bot, chat_id: int, reply_to: int, text: str, markup=None):
+    try:
+        await bot.send_message(
+            chat_id,
+            text,
+            reply_parameters=ReplyParameters(message_id=reply_to, allow_sending_without_reply=True),
+            reply_markup=markup,
+        )
+    except Exception:
+        log.exception("Could not post in comments")
+
+
+async def handle_offer(update: Update, ctx: ContextTypes.DEFAULT_TYPE, rest: str):
+    msg = update.message
+    user = msg.from_user
+    conn = db()
+    try:
+        post = locate_post(conn, msg)
+        if not post:
+            return
+        product_id, title, offers_on = post
+        variants = get_post_variants(conn, product_id)
+        if not variants:
+            return
+        if not offers_on:
+            if len(rest.split()) <= 3:
+                await msg.reply_text(
+                    "Offers aren't open on this one, but you can claim it at the listed price ☺️"
+                )
+            return
+
+        status, variant, price = parse_offer(rest, variants)
+        if status == "ignore":
+            return
+        if status == "ask":
+            if len(rest.split()) <= 6:
+                options = " / ".join(f"offer {v['name'].lower()} <price>" for v in variants)
+                await msg.reply_text(f"Which one is your offer for? 😊 Try: {options}")
+            return
+
+        if get_strikes(user.id) >= STRIKE_LIMIT:
+            await msg.reply_text(
+                "Sorry, claims and offers are paused for your account. Please message the shop. 🙏"
+            )
+            return
+
+        listed = float(variant["price"])
+        card = title if variant["name"] is None else f"{title} — {variant['name']}"
+        if price >= listed:
+            await msg.reply_text(
+                "That's at or above the listed price, so just comment “claim”"
+                + ("" if variant["name"] is None else f" {variant['name'].lower()}")
+                + " to grab it! 😊"
+            )
+            return
+        try:
+            stock, _, _ = await get_stock(variant["variant_id"])
+        except Exception:
+            log.exception("Stock lookup failed")
+            await msg.reply_text("Something went wrong, please try again in a moment 🙏")
+            return
+        if stock <= 0:
+            await msg.reply_text("😢 Sorry, this one is sold out!")
+            return
+
+        # a new offer replaces the buyer's earlier open offer on the same card
+        conn.execute(
+            "UPDATE offers SET status='withdrawn', updated_at=? "
+            "WHERE user_id=? AND variant_id=? AND status IN ('pending','countered')",
+            (now(), user.id, variant["variant_id"]),
+        )
+        cur = conn.execute(
+            "INSERT INTO offers (product_id, variant_id, title, listed_price, offer_price, "
+            "user_id, user_name, group_chat_id, group_msg_id, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                product_id, variant["variant_id"], card, listed, price, user.id,
+                display_name(user), msg.chat_id, msg.message_id, now(), now(),
+            ),
+        )
+        offer_id = cur.lastrowid
+        conn.commit()
+    finally:
+        conn.close()
+
+    pct = round(price / listed * 100)
+    await msg.reply_text(
+        f"📝 Offer received from {display_name(user)}\n\n"
+        f"Card: {card}\n"
+        f"Listed: ${listed:.2f}\n"
+        f"Offered: ${price:.2f} ({pct}%)\n\n"
+        f"The seller will review and respond."
+    )
+    await send_offer_to_admins(ctx.bot, offer_id)
+
+
+async def accept_offer(bot, offer_id: int, price: float, reply_to: int | None = None):
+    """Turn an open offer into a real claim at `price`.
+    Returns 'ok' | 'sold_out' | 'error' | 'handled'."""
+    conn = db()
+    result, remaining, o = "error", 0, None
+    try:
+        o = conn.execute(
+            "SELECT product_id, variant_id, title, listed_price, user_id, user_name, "
+            "group_chat_id, group_msg_id, status FROM offers WHERE id=?",
+            (offer_id,),
+        ).fetchone()
+        if not o or o[8] not in ("pending", "countered"):
+            return "handled"
+        product_id, variant_id, title, listed, uid, uname, gchat, gmsg, _ = o
+        async with stock_lock:
+            try:
+                stock, item_id, loc_id = await get_stock(variant_id)
+            except Exception:
+                log.exception("Stock lookup failed")
+                return "error"
+            if stock <= 0:
+                conn.execute(
+                    "UPDATE offers SET status='expired', updated_at=? WHERE id=?", (now(), offer_id)
+                )
+                conn.commit()
+                result = "sold_out"
+            else:
+                try:
+                    await adjust_stock(item_id, loc_id, -1)
+                except Exception:
+                    log.exception("Stock adjust failed")
+                    return "error"
+                conn.execute(
+                    "INSERT INTO claims (product_id, variant_id, title, price, qty, user_id, "
+                    "user_name, group_chat_id, group_msg_id, claimed_at, list_price, offer_id) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (product_id, variant_id, title, price, 1, uid, uname, gchat, gmsg, now(), listed, offer_id),
+                )
+                conn.execute(
+                    "UPDATE offers SET status='accepted', final_price=?, updated_at=? WHERE id=?",
+                    (price, now(), offer_id),
+                )
+                conn.commit()
+                remaining = stock - 1
+                result = "ok"
+    finally:
+        conn.close()
+
+    target = reply_to or gmsg
+    if result == "sold_out":
+        await post_in_thread(
+            bot, gchat, target, f"😢 Sorry {uname}, this card sold before the offer could be accepted."
+        )
+    elif result == "ok":
+        left_line = f"📦 {remaining} still available" if remaining > 0 else "🚫 Sold out!"
+        button = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("📩 Get my invoice", url=f"https://t.me/{bot.username}?start=invoice")]]
+        )
+        await post_in_thread(
+            bot, gchat, target,
+            f"✅ Offer accepted for {uname}!\n\n"
+            f"Card: {title}\n"
+            f"Price: ${price:.2f} (listed ${listed:.2f})\n\n"
+            f"{left_line}\n\n"
+            f"💌 Tap the button below and press Start within {START_DEADLINE_MIN} minutes "
+            f"so I can send your invoice.",
+            button,
+        )
+        await refresh_product_post(bot, product_id)
+    return result
+
+
+async def handle_accept(update: Update, ctx: ContextTypes.DEFAULT_TYPE, rest: str):
+    """Buyer comments 'accept' on a counter offer."""
+    msg = update.message
+    user = msg.from_user
+    conn = db()
+    try:
+        post = locate_post(conn, msg)
+        if not post:
+            return
+        product_id = post[0]
+        rows = conn.execute(
+            "SELECT id, variant_id, counter_price, updated_at FROM offers "
+            "WHERE user_id=? AND product_id=? AND status='countered' ORDER BY updated_at DESC",
+            (user.id, product_id),
+        ).fetchall()
+        if not rows:
+            return  # nothing to accept here: stay silent
+        live = [r for r in rows if now() - r[3] <= OFFER_TTL]
+        if not live:
+            await msg.reply_text("⌛ That counter offer has expired. You're welcome to make a new offer or claim at the listed price ☺️")
+            return
+        chosen = None
+        if len(live) == 1:
+            chosen = live[0]
+        else:
+            names = {v["variant_id"]: v["name"] for v in get_post_variants(conn, product_id)}
+            want = norm(rest)
+            cand = [
+                r for r in live
+                if want and names.get(r[1])
+                and (norm(names[r[1]]).startswith(want) or want in norm(names[r[1]]).split())
+            ]
+            if len(cand) == 1:
+                chosen = cand[0]
+        if not chosen:
+            await msg.reply_text("You have more than one counter offer here. Try “accept <name>” 😊")
+            return
+        offer_id, counter_price = chosen[0], chosen[2]
+    finally:
+        conn.close()
+
+    result = await accept_offer(ctx.bot, offer_id, counter_price, reply_to=msg.message_id)
+    if result == "error":
+        await msg.reply_text("Something went wrong, please try again in a moment 🙏")
+
+
+async def on_offer_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id not in ADMIN_IDS:
+        await q.answer("Admins only", show_alert=True)
+        return
+    _, action, oid = q.data.split(":")
+    oid = int(oid)
+    conn = db()
+    o = conn.execute(
+        "SELECT user_name, title, listed_price, offer_price, group_chat_id, group_msg_id, "
+        "status, updated_at FROM offers WHERE id=?",
+        (oid,),
+    ).fetchone()
+    conn.close()
+    if not o or o[6] != "pending":
+        await q.answer("Already handled.")
+        return
+    name, title, listed, offered, gchat, gmsg, _, updated = o
+    if now() - updated > OFFER_TTL:
+        await q.answer("This offer has expired.", show_alert=True)
+        return
+
+    if action == "a":
+        result = await accept_offer(ctx.bot, oid, offered)
+        if result == "ok":
+            await q.edit_message_text(f"✅ Accepted {name}'s offer of ${offered:.2f} on {title}.")
+        elif result == "sold_out":
+            await q.edit_message_text(f"😢 {title} sold out before you could accept {name}'s offer.")
+        else:
+            await q.answer("Something went wrong. Check the logs / try again.", show_alert=True)
+            return
+    elif action == "d":
+        conn = db()
+        conn.execute("UPDATE offers SET status='declined', updated_at=? WHERE id=?", (now(), oid))
+        conn.commit()
+        conn.close()
+        await post_in_thread(
+            ctx.bot, gchat, gmsg,
+            f"🙏 Offer declined for {name}\n\n"
+            f"Card: {title}\n"
+            f"Offered: ${offered:.2f}\n\n"
+            f"You're welcome to make another offer or claim at the listed price ☺️",
+        )
+        await q.edit_message_text(f"❌ Declined {name}'s offer of ${offered:.2f} on {title}.")
+    elif action == "c":
+        ctx.application.bot_data.setdefault("awaiting_counter", {})[q.from_user.id] = oid
+        await ctx.bot.send_message(
+            q.from_user.id,
+            f"💰 Countering {name}'s offer of ${offered:.2f} on {title} (listed ${listed:.2f}).\n\n"
+            f"Reply with your counter price, e.g. 12 or 12.50 (or “cancel”).",
+        )
+    await q.answer()
+
+
+async def on_private_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin types a counter price after tapping Counter."""
+    user = update.effective_user
+    if not user or user.id not in ADMIN_IDS or not update.message or not update.message.text:
+        return
+    waiting = ctx.application.bot_data.get("awaiting_counter", {})
+    oid = waiting.get(user.id)
+    if not oid:
+        return
+    text = update.message.text.strip().lower()
+    if text == "cancel":
+        waiting.pop(user.id, None)
+        await update.message.reply_text("Cancelled.")
+        return
+    m = re.match(r"^\$?\s*(\d{1,6}(?:[.,]\d{1,2})?)$", text)
+    if not m:
+        await update.message.reply_text("Please send just a price, like 12 or 12.50 (or “cancel”).")
+        return
+    price = float(m.group(1).replace(",", "."))
+    conn = db()
+    o = conn.execute(
+        "SELECT user_name, title, listed_price, offer_price, group_chat_id, group_msg_id, status "
+        "FROM offers WHERE id=?",
+        (oid,),
+    ).fetchone()
+    if not o or o[6] != "pending":
+        conn.close()
+        waiting.pop(user.id, None)
+        await update.message.reply_text("That offer was already handled.")
+        return
+    name, title, listed, offered, gchat, gmsg, _ = o
+    if not (offered < price < listed):
+        conn.close()
+        await update.message.reply_text(
+            f"The counter must be between ${offered:.2f} and ${listed:.2f}. Try again (or “cancel”)."
+        )
+        return
+    conn.execute(
+        "UPDATE offers SET status='countered', counter_price=?, updated_at=? WHERE id=?",
+        (price, now(), oid),
+    )
+    conn.commit()
+    conn.close()
+    waiting.pop(user.id, None)
+    await post_in_thread(
+        ctx.bot, gchat, gmsg,
+        f"💰 Counter offer for {name}\n\n"
+        f"Card: {title}\n"
+        f"Your offer: ${offered:.2f}\n"
+        f"Counter: ${price:.2f}\n\n"
+        f"Comment “accept” to accept or “offer <price>” to counter back!",
+    )
+    await update.message.reply_text(f"Counter of ${price:.2f} sent ✅")
+
+
+async def cmd_offers(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/offers -> re-send every offer waiting for your decision, and list open counters."""
+    if not is_admin(update):
+        return
+    conn = db()
+    pending = conn.execute(
+        "SELECT id, title, listed_price, offer_price, user_name FROM offers "
+        "WHERE status='pending' AND updated_at > ? ORDER BY id",
+        (now() - OFFER_TTL,),
+    ).fetchall()
+    countered = conn.execute(
+        "SELECT user_name, title, counter_price FROM offers "
+        "WHERE status='countered' AND updated_at > ? ORDER BY id",
+        (now() - OFFER_TTL,),
+    ).fetchall()
+    conn.close()
+    if not pending and not countered:
+        await update.message.reply_text("No open offers.")
+        return
+    for o in pending:
+        text, markup = offer_admin_message(o)
+        await update.message.reply_text(text, reply_markup=markup)
+    if countered:
+        lines = [f"• {n}: counter ${c:.2f} on {t}" for n, t, c in countered]
+        await update.message.reply_text("⏳ Waiting for buyers to reply:\n" + "\n".join(lines))
+
+
+async def expire_offers(bot):
+    conn = db()
+    rows = conn.execute(
+        "SELECT id, status, user_name, title, group_chat_id, group_msg_id FROM offers "
+        "WHERE status IN ('pending','countered') AND updated_at <= ?",
+        (now() - OFFER_TTL,),
+    ).fetchall()
+    for r in rows:
+        conn.execute("UPDATE offers SET status='expired', updated_at=? WHERE id=?", (now(), r[0]))
+    conn.commit()
+    conn.close()
+    for _, status, name, title, gchat, gmsg in rows:
+        what = "counter offer" if status == "countered" else "offer"
+        await post_in_thread(
+            bot, gchat, gmsg,
+            f"⌛ The {what} for {name} on {title} has expired. "
+            f"You're welcome to make a new offer or claim at the listed price ☺️",
+        )
 
 
 # ---------------- stage 3: invoices, payments, no-shows ----------------
@@ -737,8 +1390,7 @@ async def release_claims(bot, claim_rows, restore_stock: bool):
         conn.close()
     if not restore_stock:
         await asyncio.sleep(3)  # give Shopify a moment to restock
-    for vid in variants:
-        await refresh_variant_post(bot, vid)
+    await refresh_products_for_variants(bot, list(variants))
 
 
 async def strike_and_notify(bot, user_id: int, name: str, reason: str):
@@ -771,7 +1423,7 @@ async def create_invoice(bot, uid: int):
     try:
         async with stock_lock:
             claims = conn.execute(
-                "SELECT id, variant_id, title, price, qty, user_name FROM claims "
+                "SELECT id, variant_id, title, price, qty, user_name, list_price, offer_id FROM claims "
                 "WHERE user_id=? AND status='unpaid'",
                 (uid,),
             ).fetchall()
@@ -782,8 +1434,29 @@ async def create_invoice(bot, uid: int):
             name = claims[0][5]
 
             by_variant = {}
-            for _, vid, _, _, q, _ in claims:
-                by_variant[vid] = by_variant.get(vid, 0) + q
+            for c in claims:
+                by_variant[c[1]] = by_variant.get(c[1], 0) + c[4]
+
+            # accepted offers get their own line with a discount down to the agreed price
+            line_items, plain = [], {}
+            for c in claims:
+                vid, price, q, list_price, offer_id = c[1], c[3], c[4], c[6], c[7]
+                if offer_id and list_price and price < list_price - 0.004:
+                    line_items.append(
+                        {
+                            "variantId": vid,
+                            "quantity": q,
+                            "appliedDiscount": {
+                                "title": "Accepted offer",
+                                "description": "Accepted offer via Telegram",
+                                "value": round(list_price - price, 2),
+                                "valueType": "FIXED_AMOUNT",
+                            },
+                        }
+                    )
+                else:
+                    plain[vid] = plain.get(vid, 0) + q
+            line_items += [{"variantId": vid, "quantity": q} for vid, q in plain.items()]
 
             # The draft order reserves the stock itself, so hand our hold back first.
             restored = []
@@ -800,9 +1473,7 @@ async def create_invoice(bot, uid: int):
                     DRAFT_CREATE,
                     {
                         "input": {
-                            "lineItems": [
-                                {"variantId": vid, "quantity": q} for vid, q in by_variant.items()
-                            ],
+                            "lineItems": line_items,
                             "note": f"Telegram claims - {name} (ID {uid})",
                             "tags": ["telegram-claim"],
                             "reserveInventoryUntil": until,
@@ -979,7 +1650,7 @@ async def check_invoices(bot):
 
 async def tick(ctx: ContextTypes.DEFAULT_TYPE):
     """Runs every minute."""
-    for step in (send_due_invoices, expire_unstarted, check_invoices):
+    for step in (send_due_invoices, expire_unstarted, check_invoices, expire_offers):
         try:
             await step(ctx.bot)
         except Exception:
@@ -1040,6 +1711,9 @@ def main():
     app.add_handler(CommandHandler("invoice", cmd_invoice))
     app.add_handler(CommandHandler("strikes", cmd_strikes))
     app.add_handler(CommandHandler("clearstrikes", cmd_clearstrikes))
+    app.add_handler(CommandHandler("offers", cmd_offers))
+    app.add_handler(CallbackQueryHandler(on_offer_button, pattern=r"^of:(a|d|c):\d+$"))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_private_text))
     app.add_handler(CallbackQueryHandler(on_admin_button, pattern=r"^(paid|release):\d+$"))
     app.add_handler(MessageHandler(filters.IS_AUTOMATIC_FORWARD, on_auto_forward), group=-1)
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, on_comment))
