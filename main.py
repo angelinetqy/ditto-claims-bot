@@ -454,8 +454,6 @@ def make_caption(item) -> str:
             f"<b>💭How to claim:</b>\n"
             f'• Comment "claim" to claim! 😊'
         )
-        if offers:
-            text += '\n• Want to haggle? Comment "offer &lt;price&gt;" 💸'
         return text
 
     lines = []
@@ -472,9 +470,6 @@ def make_caption(item) -> str:
         f"<b>💭How to claim:</b>\n"
         f"• Comment {joined} to claim! 😊"
     )
-    if offers:
-        example = html.escape(variants[0]["name"].lower())
-        text += f'\n• Want to haggle? Comment "offer {example} &lt;price&gt;" 💸'
     return text
 
 
