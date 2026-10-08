@@ -48,7 +48,12 @@ POST_DELAY = int(os.environ.get("POST_DELAY", "30"))  # seconds between channel 
 INVOICE_DELAY_MIN = int(os.environ.get("INVOICE_DELAY_MIN", "15"))  # after buyer's LAST claim
 START_DEADLINE_MIN = int(os.environ.get("START_DEADLINE_MIN", "60"))  # to press Start on the bot
 PAY_DEADLINE_MIN = int(os.environ.get("PAY_DEADLINE_MIN", "60"))  # to pay after invoice is sent
+CONFIRM_WINDOW_HOURS = int(os.environ.get("CONFIRM_WINDOW_HOURS", "12"))  # time you get to confirm a checked-out order is paid
 STRIKE_LIMIT = int(os.environ.get("STRIKE_LIMIT", "3"))
+REPOST_COOLDOWN_MIN = int(os.environ.get("REPOST_COOLDOWN_MIN", "60"))  # /post skips cards posted this recently (guards against double runs)
+KEEP_OLD_POSTS = os.environ.get("KEEP_OLD_POSTS", "1") == "1"  # 1 = keep old posts and keep them updated; 0 = delete them
+SYNC_INTERVAL_MIN = int(os.environ.get("SYNC_INTERVAL_MIN", "5"))  # how often posts are refreshed from Shopify
+SYNC_WINDOW_DAYS = int(os.environ.get("SYNC_WINDOW_DAYS", "30"))  # only posts newer than this are auto-updated
 OFFER_TTL = int(os.environ.get("OFFER_EXPIRY_HOURS", "24")) * 3600  # offers/counters expire after this
 
 
@@ -143,6 +148,10 @@ def db():
             created_at INTEGER,
             updated_at INTEGER
         );
+        CREATE TABLE IF NOT EXISTS post_copies (
+            channel_msg_id INTEGER PRIMARY KEY,
+            product_id TEXT
+        );
         CREATE TABLE IF NOT EXISTS strikes (
             user_id INTEGER PRIMARY KEY,
             name TEXT,
@@ -154,6 +163,8 @@ def db():
     ensure_column(conn, "claims", "list_price", "REAL")
     ensure_column(conn, "claims", "offer_id", "INTEGER")
     ensure_column(conn, "posts", "offers_enabled", "INTEGER DEFAULT 0")
+    ensure_column(conn, "posts", "sold_out", "INTEGER DEFAULT 0")
+    ensure_column(conn, "posts", "last_caption", "TEXT")
     return conn
 
 
@@ -319,6 +330,11 @@ def _variants_from_nodes(nodes):
     ]
 
 
+def natural_key(title: str):
+    """Case-insensitive A-Z sort where numbers sort as numbers (9 before 10)."""
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", title.casefold())]
+
+
 async def fetch_sale_products():
     data = await shopify.gql(PRODUCTS_QUERY, {"q": f"tag:{SALE_TAG} AND status:active"})
     items = []
@@ -334,13 +350,36 @@ async def fetch_sale_products():
                 "image": (p["featuredImage"] or {}).get("url"),
             }
         )
-    return items
+    return sorted(items, key=lambda i: natural_key(i["title"]))  # A-Z, numbers in order
 
 
 async def fetch_product_variants(product_id: str):
     d = await shopify.gql(PRODUCT_VARIANTS_QUERY, {"id": product_id})
     p = d["product"]
     return _variants_from_nodes(p["variants"]["nodes"]) if p else []
+
+
+BULK_QUERY = """
+query($ids: [ID!]!) {
+  nodes(ids: $ids) {
+    ... on Product {
+      id
+      variants(first: 20) { nodes { id title price inventoryQuantity } }
+    }
+  }
+}
+"""
+
+
+async def fetch_variants_bulk(product_ids):
+    """{product_id: [variants]} for many products in a few calls."""
+    out = {}
+    for i in range(0, len(product_ids), 100):
+        d = await shopify.gql(BULK_QUERY, {"ids": product_ids[i : i + 100]})
+        for n in d["nodes"]:
+            if n and n.get("id") and n.get("variants"):
+                out[n["id"]] = _variants_from_nodes(n["variants"]["nodes"])
+    return out
 
 
 def get_post_variants(conn, product_id: str):
@@ -464,12 +503,27 @@ async def refresh_product_post(bot, product_id: str):
         return
     try:
         variants = await fetch_product_variants(product_id)
+        if variants and all(v["qty"] <= 0 for v in variants):
+            c2 = db()
+            c2.execute("UPDATE posts SET sold_out=1 WHERE product_id=?", (product_id,))
+            c2.commit()
+            c2.close()
         if variants:
-            await refresh_post(
-                bot,
-                row[0],
-                {"title": row[1], "variants": variants, "offers": bool(row[2])},
+            item = {"title": row[1], "variants": variants, "offers": bool(row[2])}
+            await refresh_post(bot, row[0], item)
+            c4 = db()
+            c4.execute(
+                "UPDATE posts SET last_caption=? WHERE product_id=?", (make_caption(item), product_id)
             )
+            c4.commit()
+            c4.close()
+            c3 = db()
+            copies = c3.execute(
+                "SELECT channel_msg_id FROM post_copies WHERE product_id=?", (product_id,)
+            ).fetchall()
+            c3.close()
+            for (copy_id,) in copies:  # older posts of the same card stay in sync
+                await refresh_post(bot, copy_id, item)
     except Exception:
         log.exception("Could not refresh post for %s", product_id)
 
@@ -548,13 +602,42 @@ async def cmd_myid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Your Telegram ID: {update.effective_user.id}")
 
 
+async def retire_old_post(bot, old_msg_id: int) -> str:
+    """Remove an outdated channel post. Falls back to editing it if Telegram won't delete it."""
+    try:
+        await bot.delete_message(CHANNEL, old_msg_id)
+        return "deleted"
+    except Exception as e:
+        log.warning("Could not delete old post %s: %s", old_msg_id, e)
+    note = "🔁 This listing was updated. Please see the newest post."
+    try:
+        await bot.edit_message_caption(CHANNEL, old_msg_id, caption=note)
+        return "edited"
+    except Exception:
+        try:
+            await bot.edit_message_text(note, CHANNEL, old_msg_id)
+            return "edited"
+        except Exception as e2:
+            log.warning("Could not edit old post %s: %s", old_msg_id, e2)
+    return "failed"
+
+
 async def cmd_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/post       -> post all new Shopify items tagged 'telegram' to the channel (oldest first)
-    /post test  -> send them to this chat only, nothing is saved"""
+    """/post        -> post EVERYTHING tagged 'telegram' (A-Z). A card posted before gets a fresh
+                    post at its current price/stock; its older post is kept and updated to match
+                    (set KEEP_OLD_POSTS=0 to delete older posts instead).
+    /post test   -> send to this chat only; nothing is saved or deleted
+    /post force  -> also repost cards that were posted in the last few minutes"""
     if not is_admin(update):
         return
-    test = bool(ctx.args) and ctx.args[0].lower() == "test"
+    args = [a.lower() for a in ctx.args]
+    test, force = "test" in args, "force" in args
     target = update.effective_chat.id if test else CHANNEL
+
+    state = ctx.application.bot_data
+    if not test and state.get("post_running"):
+        await update.message.reply_text("A post run is already in progress. Please wait for it to finish ⏳")
+        return
 
     await update.message.reply_text("Checking Shopify…")
     try:
@@ -564,58 +647,96 @@ async def cmd_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Couldn't reach Shopify: {e}")
         return
 
+    if not test:
+        state["post_running"] = True
     conn = db()
-    posted, skipped = 0, []
-    for item in items:
-        if not test and conn.execute(
-            "SELECT 1 FROM posts WHERE product_id = ?", (item["product_id"],)
-        ).fetchone():
-            continue
-        if all(v["qty"] <= 0 for v in item["variants"]):
-            skipped.append(f"{item['title']} (no stock)")
-            continue
-        try:
-            caption = make_caption(item)
-            if item["image"]:
-                msg = await ctx.bot.send_photo(
-                    target, item["image"], caption=caption, parse_mode="HTML"
-                )
-            else:
-                msg = await ctx.bot.send_message(target, caption, parse_mode="HTML")
-            if not test:
-                first = item["variants"][0]
-                conn.execute(
-                    "INSERT INTO posts (product_id, variant_id, channel_msg_id, title, price, "
-                    "posted_at, offers_enabled) VALUES (?,?,?,?,?,?,?)",
-                    (
-                        item["product_id"],
-                        first["id"],
-                        msg.message_id,
-                        item["title"],
-                        str(first["price"]),
-                        now(),
-                        1 if item.get("offers") else 0,
-                    ),
-                )
-                for i, v in enumerate(item["variants"]):
+    posted, replaced, skipped, undeleted = 0, 0, [], []
+    try:
+        for item in items:
+            row = conn.execute(
+                "SELECT channel_msg_id, posted_at FROM posts WHERE product_id=?",
+                (item["product_id"],),
+            ).fetchone()
+            if row and not test and not force and now() - row[1] < REPOST_COOLDOWN_MIN * 60:
+                mins = (now() - row[1]) // 60
+                skipped.append(f"{item['title']} (posted {mins} min ago; use /post force)")
+                continue
+            try:
+                msg = await send_item_post(ctx.bot, target, item)
+                if not test:
+                    first = item["variants"][0]
+                    offers = 1 if item.get("offers") else 0
+                    if row:
+                        conn.execute(
+                            "UPDATE posts SET variant_id=?, channel_msg_id=?, title=?, price=?, "
+                            "posted_at=?, offers_enabled=?, sold_out=0 WHERE product_id=?",
+                            (first["id"], msg.message_id, item["title"], str(first["price"]),
+                             now(), offers, item["product_id"]),
+                        )
+                    else:
+                        conn.execute(
+                            "INSERT INTO posts (product_id, variant_id, channel_msg_id, title, price, "
+                            "posted_at, offers_enabled) VALUES (?,?,?,?,?,?,?)",
+                            (item["product_id"], first["id"], msg.message_id, item["title"],
+                             str(first["price"]), now(), offers),
+                        )
+                    for i, v in enumerate(item["variants"]):
+                        conn.execute(
+                            "INSERT OR REPLACE INTO post_variants VALUES (?,?,?,?,?)",
+                            (v["id"], item["product_id"], v["name"], v["price"], i),
+                        )
                     conn.execute(
-                        "INSERT OR REPLACE INTO post_variants VALUES (?,?,?,?,?)",
-                        (v["id"], item["product_id"], v["name"], v["price"], i),
+                        "UPDATE posts SET last_caption=? WHERE product_id=?",
+                        (make_caption(item), item["product_id"]),
                     )
-                conn.commit()
-            posted += 1
-            if not test:
-                await asyncio.sleep(POST_DELAY)
-        except Exception as e:
-            log.exception("Post failed")
-            skipped.append(f"{item['title']} ({e})")
-    conn.close()
+                    conn.commit()
+                    if row:
+                        replaced += 1
+                        if KEEP_OLD_POSTS:
+                            conn.execute(
+                                "INSERT OR REPLACE INTO post_copies VALUES (?,?)",
+                                (row[0], item["product_id"]),
+                            )
+                            conn.commit()
+                            await refresh_product_post(ctx.bot, item["product_id"])
+                        else:
+                            outcome = await retire_old_post(ctx.bot, row[0])
+                            if outcome != "deleted":
+                                undeleted.append(f"{item['title']} ({outcome})")
+                posted += 1
+                if not test:
+                    await asyncio.sleep(POST_DELAY)
+            except Exception as e:
+                log.exception("Post failed")
+                skipped.append(f"{item['title']} ({e})")
+    finally:
+        conn.close()
+        state["post_running"] = False
 
     where = "this chat (test)" if test else CHANNEL
     text = f"Posted {posted} item(s) to {where}."
+    if replaced:
+        text += (
+            f"\n{replaced} card(s) were posted before: their older posts were kept and updated to the new price/stock."
+            if KEEP_OLD_POSTS
+            else f"\nReplaced {replaced} older post(s)."
+        )
+    if undeleted:
+        text += (
+            "\n⚠️ Couldn't delete these old posts (Telegram may limit deleting older posts), "
+            "so I marked them as updated instead. You can delete them by hand:\n"
+            + "\n".join(f"• {x}" for x in undeleted)
+        )
     if skipped:
-        text += "\nSkipped:\n" + "\n".join(f"• {s}" for s in skipped)
+        text += "\nSkipped:\n" + "\n".join(f"• {x}" for x in skipped)
     await update.message.reply_text(text)
+
+
+async def send_item_post(bot, target, item):
+    caption = make_caption(item)
+    if item["image"]:
+        return await bot.send_photo(target, item["image"], caption=caption, parse_mode="HTML")
+    return await bot.send_message(target, caption, parse_mode="HTML")
 
 
 async def cmd_claims(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -796,13 +917,10 @@ async def handle_claim(update: Update, ctx: ContextTypes.DEFAULT_TYPE, rest: str
         if channel_msg_id is None:
             return
 
-        post = conn.execute(
-            "SELECT product_id, title FROM posts WHERE channel_msg_id=?",
-            (channel_msg_id,),
-        ).fetchone()
+        post = product_for_channel_msg(conn, channel_msg_id)
         if not post:
             return
-        product_id, title = post
+        product_id, title = post[0], post[1]
         variants = get_post_variants(conn, product_id)
         if not variants:
             return
@@ -919,6 +1037,21 @@ async def on_comment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await handle_accept(update, ctx, m.group(1))
 
 
+def product_for_channel_msg(conn, channel_msg_id: int):
+    """(product_id, title, offers_enabled) for a channel post, including older kept copies."""
+    row = conn.execute(
+        "SELECT product_id, title, offers_enabled FROM posts WHERE channel_msg_id=?",
+        (channel_msg_id,),
+    ).fetchone()
+    if row:
+        return row
+    return conn.execute(
+        "SELECT p.product_id, p.title, p.offers_enabled FROM post_copies c "
+        "JOIN posts p ON p.product_id = c.product_id WHERE c.channel_msg_id=?",
+        (channel_msg_id,),
+    ).fetchone()
+
+
 def locate_post(conn, msg):
     """Which channel post is this comment under? -> (product_id, title, offers_enabled) or None."""
     channel_msg_id = None
@@ -932,10 +1065,7 @@ def locate_post(conn, msg):
         channel_msg_id = channel_msg_from(msg.reply_to_message)
     if channel_msg_id is None:
         return None
-    return conn.execute(
-        "SELECT product_id, title, offers_enabled FROM posts WHERE channel_msg_id=?",
-        (channel_msg_id,),
-    ).fetchone()
+    return product_for_channel_msg(conn, channel_msg_id)
 
 
 def display_name(user) -> str:
@@ -1613,39 +1743,68 @@ async def check_invoices(bot):
                 await finish_paid(bot, inv_id)
                 continue
             age = now() - created
-            if age >= PAY_DEADLINE_MIN * 60:
-                if order is None:
-                    # they never even checked out -> release automatically
+            if order is None:
+                # buyer hasn't checked out yet
+                if age >= PAY_DEADLINE_MIN * 60:
                     await finish_expired(
                         bot, inv_id, delete_draft=True,
                         reason="didn't check out/pay in time; claims released.",
                     )
-                elif not alerted:
-                    # checked out but money not confirmed yet -> ask the shop owner
+                elif age >= (PAY_DEADLINE_MIN - 15) * 60 and not reminded:
                     conn = db()
-                    conn.execute("UPDATE invoices SET alerted=1 WHERE id=?", (inv_id,))
+                    conn.execute("UPDATE invoices SET reminded=1 WHERE id=?", (inv_id,))
                     conn.commit()
                     conn.close()
-                    markup = InlineKeyboardMarkup(
-                        [[
-                            InlineKeyboardButton("✅ Mark paid", callback_data=f"paid:{inv_id}"),
-                            InlineKeyboardButton("❌ Release + strike", callback_data=f"release:{inv_id}"),
-                        ]]
-                    )
-                    await notify_admins(
-                        bot,
-                        f"⏰ {name}'s payment window is over and order {order['name']} isn't marked "
-                        f"paid. Check your bank, then choose:",
-                        markup,
-                    )
-            elif age >= (PAY_DEADLINE_MIN - 15) * 60 and not reminded:
+                    await safe_dm(bot, chat_id, "⏰ Reminder: about 15 minutes left to check out before your claims are released.")
+            elif age >= CONFIRM_WINDOW_HOURS * 3600 and not alerted:
+                # checked out, but you haven't confirmed the money yet -> ask the shop owner
                 conn = db()
-                conn.execute("UPDATE invoices SET reminded=1 WHERE id=?", (inv_id,))
+                conn.execute("UPDATE invoices SET alerted=1 WHERE id=?", (inv_id,))
                 conn.commit()
                 conn.close()
-                await safe_dm(bot, chat_id, "⏰ Reminder: about 15 minutes left to pay before your claims are released.")
+                markup = InlineKeyboardMarkup(
+                    [[
+                        InlineKeyboardButton("✅ Mark paid", callback_data=f"paid:{inv_id}"),
+                        InlineKeyboardButton("❌ Release + strike", callback_data=f"release:{inv_id}"),
+                    ]]
+                )
+                await notify_admins(
+                    bot,
+                    f"⏰ {name}'s order {order['name']} still isn't marked paid after "
+                    f"{CONFIRM_WINDOW_HOURS} hours. Check your bank, then choose:",
+                    markup,
+                )
         except Exception:
             log.exception("check_invoices failed for invoice %s", inv_id)
+
+
+async def auto_sync(bot):
+    """Every few minutes: if a post's price/stock differs from Shopify, edit the post."""
+    conn = db()
+    rows = conn.execute(
+        "SELECT product_id, title, offers_enabled, last_caption FROM posts WHERE posted_at > ?",
+        (now() - SYNC_WINDOW_DAYS * 86400,),
+    ).fetchall()
+    conn.close()
+    if not rows:
+        return
+    by_product = await fetch_variants_bulk([r[0] for r in rows])
+    for product_id, title, offers, last_caption in rows:
+        variants = by_product.get(product_id)
+        if not variants:
+            continue
+        caption = make_caption({"title": title, "variants": variants, "offers": bool(offers)})
+        if caption == last_caption:
+            continue
+        await refresh_product_post(bot, product_id)
+        await asyncio.sleep(1)
+
+
+async def auto_sync_job(ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        await auto_sync(ctx.bot)
+    except Exception:
+        log.exception("auto_sync failed")
 
 
 async def tick(ctx: ContextTypes.DEFAULT_TYPE):
@@ -1706,6 +1865,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(CommandHandler("post", cmd_post, block=False))
+    app.add_handler(CommandHandler("repost", cmd_post, block=False))
     app.add_handler(CommandHandler("claims", cmd_claims))
     app.add_handler(CommandHandler("sync", cmd_sync))
     app.add_handler(CommandHandler("invoice", cmd_invoice))
@@ -1718,6 +1878,7 @@ def main():
     app.add_handler(MessageHandler(filters.IS_AUTOMATIC_FORWARD, on_auto_forward), group=-1)
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, on_comment))
     app.job_queue.run_repeating(tick, interval=60, first=20)
+    app.job_queue.run_repeating(auto_sync_job, interval=SYNC_INTERVAL_MIN * 60, first=90)
     log.info("Bot running")
     app.run_polling()
 
