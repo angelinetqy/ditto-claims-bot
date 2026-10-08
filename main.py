@@ -54,6 +54,7 @@ REPOST_COOLDOWN_MIN = int(os.environ.get("REPOST_COOLDOWN_MIN", "60"))  # /post 
 KEEP_OLD_POSTS = os.environ.get("KEEP_OLD_POSTS", "1") == "1"  # 1 = keep old posts and keep them updated; 0 = delete them
 SYNC_INTERVAL_MIN = int(os.environ.get("SYNC_INTERVAL_MIN", "5"))  # how often posts are refreshed from Shopify
 SYNC_WINDOW_DAYS = int(os.environ.get("SYNC_WINDOW_DAYS", "30"))  # only posts newer than this are auto-updated
+OFFERS_ON_ALL = os.environ.get("OFFERS_ON_ALL", "1") == "1"  # 1 = every card accepts offers; 0 = only cards tagged "offers"
 OFFER_TTL = int(os.environ.get("OFFER_EXPIRY_HOURS", "24")) * 3600  # offers/counters expire after this
 
 
@@ -346,7 +347,7 @@ async def fetch_sale_products():
                 "product_id": p["id"],
                 "title": p["title"],
                 "variants": _variants_from_nodes(p["variants"]["nodes"]),
-                "offers": "offers" in [t.lower() for t in p.get("tags", [])],
+                "offers": OFFERS_ON_ALL or "offers" in [t.lower() for t in p.get("tags", [])],
                 "image": (p["featuredImage"] or {}).get("url"),
             }
         )
@@ -364,6 +365,7 @@ query($ids: [ID!]!) {
   nodes(ids: $ids) {
     ... on Product {
       id
+      tags
       variants(first: 20) { nodes { id title price inventoryQuantity } }
     }
   }
@@ -372,13 +374,16 @@ query($ids: [ID!]!) {
 
 
 async def fetch_variants_bulk(product_ids):
-    """{product_id: [variants]} for many products in a few calls."""
+    """{product_id: (variants, offers_tag_present)} for many products in a few calls."""
     out = {}
     for i in range(0, len(product_ids), 100):
         d = await shopify.gql(BULK_QUERY, {"ids": product_ids[i : i + 100]})
         for n in d["nodes"]:
             if n and n.get("id") and n.get("variants"):
-                out[n["id"]] = _variants_from_nodes(n["variants"]["nodes"])
+                out[n["id"]] = (
+                    _variants_from_nodes(n["variants"]["nodes"]),
+                    OFFERS_ON_ALL or "offers" in [t.lower() for t in n.get("tags", [])],
+                )
     return out
 
 
@@ -509,7 +514,7 @@ async def refresh_product_post(bot, product_id: str):
             c2.commit()
             c2.close()
         if variants:
-            item = {"title": row[1], "variants": variants, "offers": bool(row[2])}
+            item = {"title": row[1], "variants": variants, "offers": OFFERS_ON_ALL or bool(row[2])}
             await refresh_post(bot, row[0], item)
             c4 = db()
             c4.execute(
@@ -1146,7 +1151,7 @@ async def handle_offer(update: Update, ctx: ContextTypes.DEFAULT_TYPE, rest: str
         variants = get_post_variants(conn, product_id)
         if not variants:
             return
-        if not offers_on:
+        if not (OFFERS_ON_ALL or offers_on):
             if len(rest.split()) <= 3:
                 await msg.reply_text(
                     "Offers aren't open on this one, but you can claim it at the listed price ☺️"
@@ -1790,10 +1795,19 @@ async def auto_sync(bot):
         return
     by_product = await fetch_variants_bulk([r[0] for r in rows])
     for product_id, title, offers, last_caption in rows:
-        variants = by_product.get(product_id)
-        if not variants:
+        found = by_product.get(product_id)
+        if not found:
             continue
-        caption = make_caption({"title": title, "variants": variants, "offers": bool(offers)})
+        variants, offers_now = found
+        if offers_now != bool(offers):  # you added/removed the "offers" tag in Shopify
+            c5 = db()
+            c5.execute(
+                "UPDATE posts SET offers_enabled=? WHERE product_id=?",
+                (1 if offers_now else 0, product_id),
+            )
+            c5.commit()
+            c5.close()
+        caption = make_caption({"title": title, "variants": variants, "offers": offers_now})
         if caption == last_caption:
             continue
         await refresh_product_post(bot, product_id)
